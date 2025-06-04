@@ -1,4 +1,4 @@
-#include <experimental/filesystem>
+#include <filesystem>
 
 struct AsyncFileStreamer {
 
@@ -12,7 +12,7 @@ struct AsyncFileStreamer {
 
     void updateRootCache() {
         // todo: if the root folder changes, we want to reload the cache
-        for(auto &p : std::experimental::filesystem::recursive_directory_iterator(root)) {
+        for(auto &p : std::filesystem::recursive_directory_iterator(root)) {
             std::string url = p.path().string().substr(root.length());
             if (url == "/index.html") {
                 url = "/";
@@ -38,7 +38,8 @@ struct AsyncFileStreamer {
     static void streamFile(uWS::HttpResponse<SSL> *res, AsyncFileReader *asyncFileReader) {
         /* Peek from cache */
         std::string_view chunk = asyncFileReader->peek(res->getWriteOffset());
-        if (!chunk.length() || res->tryEnd(chunk, asyncFileReader->getFileSize())) {
+        auto remaining_data = asyncFileReader->getFileSize() - res->getWriteOffset();
+        if (!chunk.length() || res->tryEnd(chunk, remaining_data).first) {
             /* Request new chunk */
             // todo: we need to abort this callback if peer closed!
             // this also means Loop::defer needs to support aborting (functions should embedd an atomic boolean abort or something)
@@ -50,7 +51,7 @@ struct AsyncFileStreamer {
 
             // us_socket_up_ref eftersom vi delar ägandeskapet
 
-            if (chunk.length() < asyncFileReader->getFileSize()) {
+            if (chunk.length() < remaining_data) {
                 asyncFileReader->request(res->getWriteOffset(), [res, asyncFileReader](std::string_view chunk) {
                     // check if we were closed in the mean time
                     //if (us_socket_is_closed()) {

@@ -1,5 +1,5 @@
 /*
- * Authored by Alex Hultman, 2018-2019.
+ * Authored by Alex Hultman, 2018-2020.
  * Intellectual property of third-party.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,8 +22,9 @@
 
 #include "HttpParser.h"
 #include "AsyncSocketData.h"
+#include "ProxyParser.h"
 
-#include "f2/function2.hpp"
+#include "MoveOnlyFunction.h"
 
 namespace uWS {
 
@@ -31,6 +32,36 @@ template <bool SSL>
 struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
     template <bool> friend struct HttpResponse;
     template <bool> friend struct HttpContext;
+
+    /* When we are done with a response we mark it like so */
+    void markDone() {
+        onAborted = nullptr;
+        /* Also remove onWritable so that we do not emit when draining behind the scenes. */
+        onWritable = nullptr;
+
+        /* We are done with this request */
+        state &= ~HttpResponseData<SSL>::HTTP_RESPONSE_PENDING;
+    }
+
+    /* Caller of onWritable. It is possible onWritable calls markDone so we need to borrow it. */
+    bool callOnWritable(uintmax_t offset) {
+        /* Borrow real onWritable */
+        MoveOnlyFunction<bool(uintmax_t)> borrowedOnWritable = std::move(onWritable);
+
+        /* Set onWritable to placeholder */
+        onWritable = [](uintmax_t) {return true;};
+
+        /* Run borrowed onWritable */
+        bool ret = borrowedOnWritable(offset);
+
+        /* If we still have onWritable (the placeholder) then move back the real one */
+        if (onWritable) {
+            /* We haven't reset onWritable, so give it back */
+            onWritable = std::move(borrowedOnWritable);
+        }
+
+        return ret;
+    }
 private:
     /* Bits of status */
     enum {
@@ -38,18 +69,25 @@ private:
         HTTP_WRITE_CALLED = 2, // used
         HTTP_END_CALLED = 4, // used
         HTTP_RESPONSE_PENDING = 8, // used
-        HTTP_ENDED_STREAM_OUT = 16 // not used
+        HTTP_CONNECTION_CLOSE = 16 // used
     };
 
     /* Per socket event handlers */
-    fu2::unique_function<bool(int)> onWritable;
-    fu2::unique_function<void()> onAborted;
-    fu2::unique_function<void(std::string_view, bool)> inStream; // onData
+    MoveOnlyFunction<bool(uintmax_t)> onWritable;
+    MoveOnlyFunction<void()> onAborted;
+    MoveOnlyFunction<void(std::string_view, bool)> inStream; // onData
     /* Outgoing offset */
-    int offset = 0;
+    uintmax_t offset = 0;
+
+    /* Let's track number of bytes since last timeout reset in data handler */
+    unsigned int received_bytes_per_timeout = 0;
 
     /* Current state (content-length sent, status sent, write called, etc */
     int state = 0;
+
+#ifdef UWS_WITH_PROXY
+    ProxyParser proxyParser;
+#endif
 };
 
 }

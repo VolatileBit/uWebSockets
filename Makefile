@@ -1,15 +1,20 @@
-EXAMPLE_FILES := HelloWorld EchoServer BroadcastingEchoServer
-THREADED_EXAMPLE_FILES := HelloWorldThreaded EchoServerThreaded
-override CXXFLAGS += -std=c++17 -Isrc -IuSockets/src
-override LDFLAGS += uSockets/*.o -lz
+# This is the NMake shim for Windows (WIP)
+# Example: $Env:WITH_ZLIB='0'; $ENV:WITH_LTO='0'; $Env:CC='clang'; $ENV:CFLAGS='-I C:\vcpkg\installed\x64-windows\include'; $ENV:LDFLAGS='-L C:\vcpkg\installed\x64-windows\lib'; $ENV:CXX='clang++'; $ENV:EXEC_SUFFIX='.exe'; $ENV:WITH_LIBUV='1'; nmake
 
-.PHONY: examples
-examples:
-	cd uSockets && WITH_SSL=0 make
-	$(foreach FILE,$(EXAMPLE_FILES),$(CXX) -flto -O3 $(CXXFLAGS) examples/$(FILE).cpp -o $(FILE) $(LDFLAGS);)
-	$(foreach FILE,$(THREADED_EXAMPLE_FILES),$(CXX) -pthread -flto -O3 $(CXXFLAGS) examples/$(FILE).cpp -o $(FILE) $(LDFLAGS);)
+examples: default
+	.\build.exe examples || .\a.exe examples
 
-all:
-	make examples
-	cd fuzzing && make && rm -f *.o
-	cd benchmarks && make && rm -f *.o
+clean: default
+	.\build.exe clean || .\a.exe clean
+
+capi: default
+	.\build.exe capi || .\a.exe capi
+
+all: default
+	.\build.exe all || .\a.exe all
+
+default:
+	cd uSockets
+	$(CC) $(CFLAGS) -DLIBUS_NO_SSL -std=c11 -Isrc -O3 -c src/*.c src/eventing/*.c src/crypto/*.c
+	cd ..
+	$(CC) build.c

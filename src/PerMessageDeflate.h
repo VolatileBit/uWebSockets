@@ -1,5 +1,5 @@
 /*
- * Authored by Alex Hultman, 2018-2019.
+ * Authored by Alex Hultman, 2018-2021.
  * Intellectual property of third-party.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,22 +20,77 @@
 #ifndef UWS_PERMESSAGEDEFLATE_H
 #define UWS_PERMESSAGEDEFLATE_H
 
+#include <cstdint>
+#include <cstring>
+
+/* We always define these options no matter if ZLIB is enabled or not */
+namespace uWS {
+    /* Compressor mode is 8 lowest bits where HIGH4(windowBits), LOW4(memLevel).
+     * Decompressor mode is 8 highest bits LOW4(windowBits).
+     * If compressor or decompressor bits are 1, then they are shared.
+     * If everything is just simply 0, then everything is disabled. */
+    enum CompressOptions : uint16_t {
+        /* These are not actual compression options */
+        _COMPRESSOR_MASK = 0x00FF,
+        _DECOMPRESSOR_MASK = 0x0F00,
+        /* Disabled, shared, shared are "special" values */
+        DISABLED = 0,
+        SHARED_COMPRESSOR = 1,
+        SHARED_DECOMPRESSOR = 1 << 8,
+        /* Highest 4 bits describe decompressor */
+        DEDICATED_DECOMPRESSOR_32KB = 15 << 8,
+        DEDICATED_DECOMPRESSOR_16KB = 14 << 8,
+        DEDICATED_DECOMPRESSOR_8KB = 13 << 8,
+        DEDICATED_DECOMPRESSOR_4KB = 12 << 8,
+        DEDICATED_DECOMPRESSOR_2KB = 11 << 8,
+        DEDICATED_DECOMPRESSOR_1KB = 10 << 8,
+        DEDICATED_DECOMPRESSOR_512B = 9 << 8,
+        /* Same as 32kb */
+        DEDICATED_DECOMPRESSOR = 15 << 8,
+
+        /* Lowest 8 bit describe compressor */
+        DEDICATED_COMPRESSOR_3KB = 9 << 4 | 1,
+        DEDICATED_COMPRESSOR_4KB = 9 << 4 | 2,
+        DEDICATED_COMPRESSOR_8KB = 10 << 4 | 3,
+        DEDICATED_COMPRESSOR_16KB = 11 << 4 | 4,
+        DEDICATED_COMPRESSOR_32KB = 12 << 4 | 5,
+        DEDICATED_COMPRESSOR_64KB = 13 << 4 | 6,
+        DEDICATED_COMPRESSOR_128KB = 14 << 4 | 7,
+        DEDICATED_COMPRESSOR_256KB = 15 << 4 | 8,
+        /* Same as 256kb */
+        DEDICATED_COMPRESSOR = 15 << 4 | 8
+    };
+}
+
+#if !defined(UWS_NO_ZLIB) && !defined(UWS_MOCK_ZLIB)
 #include <zlib.h>
+#endif
+
 #include <string>
+#include <optional>
+
+#ifdef UWS_USE_LIBDEFLATE
+#include "libdeflate.h"
+#include <cstring>
+#endif
 
 namespace uWS {
 
 /* Do not compile this module if we don't want it */
-#ifdef UWS_NO_ZLIB
+#if defined(UWS_NO_ZLIB) || defined(UWS_MOCK_ZLIB)
 struct ZlibContext {};
 struct InflationStream {
-    std::string_view inflate(ZlibContext *zlibContext, std::string_view compressed, size_t maxPayloadLength) {
-        return compressed;
+    std::optional<std::string_view> inflate(ZlibContext * /*zlibContext*/, std::string_view compressed, size_t maxPayloadLength, bool /*reset*/) {
+        return compressed.substr(0, std::min(maxPayloadLength, compressed.length()));
+    }
+    InflationStream(CompressOptions /*compressOptions*/) {
     }
 };
 struct DeflationStream {
-    std::string_view deflate(ZlibContext *zlibContext, std::string_view raw, bool reset) {
+    std::string_view deflate(ZlibContext * /*zlibContext*/, std::string_view raw, bool /*reset*/) {
         return raw;
+    }
+    DeflationStream(CompressOptions /*compressOptions*/) {
     }
 };
 #else
@@ -51,26 +106,50 @@ struct ZlibContext {
     char *deflationBuffer;
     char *inflationBuffer;
 
+#ifdef UWS_USE_LIBDEFLATE
+    libdeflate_decompressor *decompressor;
+    libdeflate_compressor *compressor;
+#endif
+
     ZlibContext() {
         deflationBuffer = (char *) malloc(LARGE_BUFFER_SIZE);
         inflationBuffer = (char *) malloc(LARGE_BUFFER_SIZE);
+
+#ifdef UWS_USE_LIBDEFLATE
+        decompressor = libdeflate_alloc_decompressor();
+        compressor = libdeflate_alloc_compressor(6);
+#endif
     }
 
     ~ZlibContext() {
         free(deflationBuffer);
         free(inflationBuffer);
+
+#ifdef UWS_USE_LIBDEFLATE
+        libdeflate_free_decompressor(decompressor);
+        libdeflate_free_compressor(compressor);
+#endif
     }
 };
 
 struct DeflationStream {
     z_stream deflationStream = {};
 
-    DeflationStream() {
-        deflateInit2(&deflationStream, 1, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+    DeflationStream(CompressOptions compressOptions) {
+
+        /* Sliding inflator should be about 44kb by default, less than compressor */
+
+        /* Memory usage is given by 2 ^ (windowBits + 2) + 2 ^ (memLevel + 9) */
+        int windowBits = -(int) ((compressOptions & _COMPRESSOR_MASK) >> 4), memLevel = compressOptions & 0xF;
+
+        //printf("windowBits: %d, memLevel: %d\n", windowBits, memLevel);
+
+        deflateInit2(&deflationStream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, windowBits, memLevel, Z_DEFAULT_STRATEGY);
     }
 
-    /* Deflate and optionally reset */
+    /* Deflate and optionally reset. You must not deflate an empty string. */
     std::string_view deflate(ZlibContext *zlibContext, std::string_view raw, bool reset) {
+
         /* Odd place to clear this one, fix */
         zlibContext->dynamicDeflationBuffer.clear();
 
@@ -102,9 +181,11 @@ struct DeflationStream {
         if (zlibContext->dynamicDeflationBuffer.length()) {
             zlibContext->dynamicDeflationBuffer.append(zlibContext->deflationBuffer, DEFLATE_OUTPUT_CHUNK - deflationStream.avail_out);
 
-            return {(char *) zlibContext->dynamicDeflationBuffer.data(), zlibContext->dynamicDeflationBuffer.length() - 4};
+            return std::string_view((char *) zlibContext->dynamicDeflationBuffer.data(), zlibContext->dynamicDeflationBuffer.length() - 4);
         }
 
+        /* Note: We will get an interger overflow resulting in heap buffer overflow if Z_BUF_ERROR is returned
+         * from passing 0 as avail_in. Therefore we must not deflate an empty string */
         return {
             zlibContext->deflationBuffer,
             DEFLATE_OUTPUT_CHUNK - deflationStream.avail_out - 4
@@ -119,15 +200,48 @@ struct DeflationStream {
 struct InflationStream {
     z_stream inflationStream = {};
 
-    InflationStream() {
-        inflateInit2(&inflationStream, -15);
+    InflationStream(CompressOptions compressOptions) {
+        /* Inflation windowBits are the top 8 bits of the 16 bit compressOptions */
+        inflateInit2(&inflationStream, -(compressOptions >> 8));
     }
 
     ~InflationStream() {
         inflateEnd(&inflationStream);
     }
 
-    std::string_view inflate(ZlibContext *zlibContext, std::string_view compressed, size_t maxPayloadLength) {
+    /* Zero length inflates are possible and valid */
+    std::optional<std::string_view> inflate(ZlibContext *zlibContext, std::string_view compressed, size_t maxPayloadLength, bool reset) {
+
+#ifdef UWS_USE_LIBDEFLATE
+        if (reset) {
+            /* Try fast path first (assuming single DEFLATE block and shared compressor aka reset = true) */
+            size_t written = 0, consumed;
+            zlibContext->dynamicInflationBuffer.clear();
+            zlibContext->dynamicInflationBuffer.reserve(maxPayloadLength);
+
+            ((char *)compressed.data())[0] |= 0x1; // BFINAL = 1
+            libdeflate_result res = libdeflate_deflate_decompress_ex(zlibContext->decompressor, compressed.data(), compressed.length(), zlibContext->dynamicInflationBuffer.data(), maxPayloadLength, &consumed, &written);
+    
+            /* Still not entirely sure why 1 extra zero byte is optional and ignored by both zlib and libdeflate in some cases */
+            /* Minimal reproducer is load_test.c with 102 byte message size. It should be tested with Chrome at various message sizes as well. */
+            if (res == 0 && (consumed == compressed.length() || (consumed + 1 == compressed.length() && compressed[consumed] == '\0'))) {
+                return std::string_view(zlibContext->dynamicInflationBuffer.data(), written);
+            } else {
+                /* We can only end up here if the first DEFLATE block was not the last, so mark it as such */
+                ((char *)compressed.data())[0] &= ~0x1; // BFINAL = 0
+            }
+        }
+#endif
+
+        /* Save off the bytes we're about to overwrite */
+        char* tailLocation = (char*)compressed.data() + compressed.length();
+        char preTailBytes[4];
+        memcpy(preTailBytes, tailLocation, 4);
+
+        /* Append tail to chunk */
+        unsigned char tail[4] = {0x00, 0x00, 0xff, 0xff};
+        memcpy(tailLocation, tail, 4);
+        compressed = {compressed.data(), compressed.length() + 4};
 
         /* We clear this one here, could be done better */
         zlibContext->dynamicInflationBuffer.clear();
@@ -150,18 +264,34 @@ struct InflationStream {
 
         } while (inflationStream.avail_out == 0 && zlibContext->dynamicInflationBuffer.length() <= maxPayloadLength);
 
-        inflateReset(&inflationStream);
+        if (reset) {
+            inflateReset(&inflationStream);
+        }
+
+        /* Restore the bytes we used for the tail */
+        memcpy(tailLocation, preTailBytes, 4);
 
         if ((err != Z_BUF_ERROR && err != Z_OK) || zlibContext->dynamicInflationBuffer.length() > maxPayloadLength) {
-            return {nullptr, 0};
+            return std::nullopt;
         }
 
         if (zlibContext->dynamicInflationBuffer.length()) {
             zlibContext->dynamicInflationBuffer.append(zlibContext->inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);
-            return {zlibContext->dynamicInflationBuffer.data(), zlibContext->dynamicInflationBuffer.length()};
+
+            /* Let's be strict about the max size */
+            if (zlibContext->dynamicInflationBuffer.length() > maxPayloadLength) {
+                return std::nullopt;
+            }
+
+            return std::string_view(zlibContext->dynamicInflationBuffer.data(), zlibContext->dynamicInflationBuffer.length());
         }
 
-        return {zlibContext->inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out};
+        /* Let's be strict about the max size */
+        if ((LARGE_BUFFER_SIZE - inflationStream.avail_out) > maxPayloadLength) {
+            return std::nullopt;
+        }
+
+        return std::string_view(zlibContext->inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);
     }
 
 };

@@ -1,5 +1,5 @@
 /*
- * Authored by Alex Hultman, 2018-2019.
+ * Authored by Alex Hultman, 2018-2020.
  * Intellectual property of third-party.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,7 @@
 #include "HttpRouter.h"
 
 #include <vector>
-#include "f2/function2.hpp"
+#include "MoveOnlyFunction.h"
 
 namespace uWS {
 template<bool> struct HttpResponse;
@@ -31,16 +31,28 @@ template <bool SSL>
 struct alignas(16) HttpContextData {
     template <bool> friend struct HttpContext;
     template <bool> friend struct HttpResponse;
+    template <bool> friend struct TemplatedApp;
 private:
-    std::vector<fu2::unique_function<void(HttpResponse<SSL> *, int)>> filterHandlers;
+    std::vector<MoveOnlyFunction<void(HttpResponse<SSL> *, int)>> filterHandlers;
+
+    MoveOnlyFunction<void(const char *hostname)> missingServerNameHandler;
 
     struct RouterData {
         HttpResponse<SSL> *httpResponse;
         HttpRequest *httpRequest;
     };
 
+    /* This is the currently browsed-to router when using SNI */
+    HttpRouter<RouterData> *currentRouter = &router;
+
+    /* This is the default router for default SNI or non-SSL */
     HttpRouter<RouterData> router;
     void *upgradedWebSocket = nullptr;
+    bool isParsingHttp = false;
+
+    /* If we are main acceptor, distribute to these apps */
+    std::vector<void *> childApps;
+    unsigned int roundRobin = 0;
 };
 
 }
